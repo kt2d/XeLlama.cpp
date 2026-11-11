@@ -6,6 +6,27 @@
 
 <b>LLM inference in C/C++</b>
 
+> [!NOTE]
+> **XeLlama.cpp is an unofficial fork of [llama.cpp](https://github.com/ggml-org/llama.cpp),
+> specialised for Intel Xe (Arc) GPUs.** It is not affiliated with, endorsed by, or
+> connected to Intel, Meta, or ggml-org. Upstream development happens in llama.cpp;
+> this fork carries Xe-specific changes on top of it.
+>
+> What this fork adds (work in progress, rebased onto upstream master `3b4d6ab`):
+>
+> - QSA (Qwen Sparse Attention) support for Qwen3.8-27B on the SYCL backend
+> - SYCL/XMX kernel work for Arc B60 (Xe2) and A770 (Xe1): mixed-type fattn-dpas,
+>   wide-column int8 DPAS prefill GEMM, and sg8 fattn-dpas for Alchemist
+> - A measured long-context configuration (tensor split, q8_0/q4_0 KV,
+>   `GGML_SYCL_SPARSE_FA=1`, `GGML_SYCL_FA_ONEDNN=0`, `GGML_SYCL_DPAS_GEMM=1`,
+>   `GGML_SYCL_FA_DPAS_SG8=1`), with MTP off for long-context use
+>
+> **Credits**: The QSA model and its trained indexers are by
+> [higa2515](https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF).
+> QSA support in this fork was implemented with reference to
+> [kuraneko1's QSA fork of llama.cpp](https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp).
+
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
 [![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
