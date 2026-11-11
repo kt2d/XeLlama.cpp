@@ -20,6 +20,11 @@
 > - A measured long-context configuration (tensor split, q8_0/q4_0 KV,
 >   `GGML_SYCL_SPARSE_FA=1`, `GGML_SYCL_FA_ONEDNN=0`, `GGML_SYCL_DPAS_GEMM=1`,
 >   `GGML_SYCL_FA_DPAS_SG8=1`), with MTP off for long-context use
+>
+> **Credits**: The QSA model and its trained indexers are by
+> [higa2515](https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF).
+> QSA support in this fork was implemented with reference to
+> [kuraneko1's QSA fork of llama.cpp](https://github.com/kuraneko1/Qwen3.8-27B-QSA-llama.cpp).
 
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
