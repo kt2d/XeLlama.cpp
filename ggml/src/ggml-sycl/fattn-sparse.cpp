@@ -11,6 +11,9 @@ static constexpr int64_t SPARSE_FA_MIN_RATIO = 2;
 extern int g_ggml_sycl_enable_sparse_fa;
 extern int g_ggml_sycl_debug_sparse_fa;
 extern int g_ggml_sycl_sparse_fa_margin;
+extern int g_ggml_sycl_sparse_fa_prefill;
+extern int g_ggml_sycl_enable_mkl_fa;
+extern int g_ggml_sycl_fa_onednn;
 
 static int sparse_fa_enabled(void) {
     return g_ggml_sycl_enable_sparse_fa;
@@ -23,6 +26,11 @@ static int sparse_fa_debug(void) {
 // slack above n_kv_max; callers may exceed the hint by a few always-attended positions
 static int sparse_fa_margin(void) {
     return g_ggml_sycl_sparse_fa_margin;
+}
+
+// requested prefill chunk rows (0 = prefill gather off)
+static int sparse_fa_prefill_chunk(void) {
+    return g_ggml_sycl_sparse_fa_prefill;
 }
 
 // Unordered output is fine: softmax over the selected set is permutation invariant.
@@ -52,6 +60,32 @@ static void sparse_fa_compact_mask(sycl::queue * stream,
             if (pos < (int32_t) n_kv_g) {
                 indices[pos] = (int32_t) i;
             }
+        });
+}
+
+// Union of a chunk of mask rows: a column survives if any row of the chunk
+// keeps it. Written as 0 / -inf halves so sparse_fa_compact_mask consumes the
+// result unchanged. The union is a superset of every row's own selection, and
+// the per-row gathered mask still masks out the rest, so the attention result
+// is unchanged; only the dense work shrinks.
+static void sparse_fa_union_rows(sycl::queue * stream,
+                                 const sycl::half * __restrict__ mask,
+                                 sycl::half * __restrict__ uni,
+                                 const int64_t n_kv,
+                                 const int64_t n_rows,
+                                 const size_t mask_s1) {
+    stream->parallel_for(
+        sycl::range<1>((size_t) n_kv),
+        [=](sycl::id<1> id) {
+            const int64_t i = (int64_t) id[0];
+            bool keep = false;
+            for (int64_t r = 0; r < n_rows; ++r) {
+                if (sycl::isfinite((float) mask[(size_t) r * mask_s1 + (size_t) i])) {
+                    keep = true;
+                    break;
+                }
+            }
+            uni[i] = keep ? sycl::half(0.0f) : sycl::half(-INFINITY);
         });
 }
 
@@ -171,7 +205,210 @@ static bool sparse_fa_applicable(const ggml_tensor * dst, int64_t & n_kv_g_out) 
     return true;
 }
 
+// Prefill variant: process a multi-row Q in chunks of rows, gather the union
+// of each chunk's selected KV rows once, and let the dense kernels run on the
+// gathered rows. The chunk is clamped so the worst-case union bound
+// (chunk x per-row kept count) still satisfies the ratio gate, and engagement
+// requires chunk >= 32 so the re-dispatched call keeps the MKL kernel's
+// minimum query rows. Restricted to the deployed FA configuration (MKL on,
+// oneDNN off): the oneDNN path stages through buffers reserved after dst,
+// which chunk views of dst cannot provide.
+static bool sparse_fa_prefill_applicable(const ggml_tensor * dst,
+                                         int64_t & chunk_out,
+                                         int64_t & n_kv_g_out) {
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    if (!Q || !K || !V || !mask) {
+        return false;
+    }
+    if (g_ggml_sycl_enable_mkl_fa != 1 || g_ggml_sycl_fa_onednn != 0) {
+        return false;
+    }
+    if (sinks && ggml_nelements(sinks) > 0) {
+        return false;
+    }
+
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    if (n_kv_max <= 0) {
+        return false;
+    }
+
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+
+    if (Q->ne[1] <= 1 || Q->ne[3] != 1 || dst->ne[2] != Q->ne[1] || dst->ne[3] != 1) {
+        return false;
+    }
+    if (K->ne[3] != 1 || V->ne[3] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1) {
+        return false;
+    }
+    if (mask->type != GGML_TYPE_F16 || mask->ne[0] < K->ne[1] || mask->ne[1] != Q->ne[1]) {
+        return false;
+    }
+    if (K->ne[2] != V->ne[2]) {
+        return false;
+    }
+    if (K->nb[0] != ggml_type_size(K->type) || V->nb[0] != ggml_type_size(V->type)) {
+        return false;
+    }
+
+    const size_t k_row = ggml_row_size(K->type, K->ne[0]);
+    const size_t v_row = ggml_row_size(V->type, V->ne[0]);
+    if (k_row % sizeof(uint32_t) || v_row % sizeof(uint32_t)) {
+        return false;
+    }
+
+    const int64_t n_kv = K->ne[1];
+    int64_t chunk = sparse_fa_prefill_chunk();
+    const int64_t fit = n_kv / (SPARSE_FA_MIN_RATIO * (int64_t) n_kv_max);
+    if (fit < chunk) {
+        chunk = fit;
+    }
+    if (chunk < 32) {
+        return false;
+    }
+
+    const int64_t n_kv_g = GGML_PAD(chunk * (int64_t) n_kv_max + sparse_fa_margin(), SPARSE_FA_PAD);
+    if (n_kv_g * SPARSE_FA_MIN_RATIO > n_kv) {
+        return false;
+    }
+
+    chunk_out  = chunk;
+    n_kv_g_out = n_kv_g;
+    return true;
+}
+
+static bool sparse_fa_prefill_gather(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
+                                     const int64_t chunk, const int64_t n_kv_g) {
+    ggml_tensor * Q    = dst->src[0];
+    ggml_tensor * K    = dst->src[1];
+    ggml_tensor * V    = dst->src[2];
+    ggml_tensor * mask = dst->src[3];
+
+    const int64_t n_kv     = K->ne[1];
+    const int64_t n_head_k = K->ne[2];
+    const int64_t n_rows   = Q->ne[1];
+
+    const size_t k_row   = ggml_row_size(K->type, K->ne[0]);
+    const size_t v_row   = ggml_row_size(V->type, V->ne[0]);
+    const size_t mask_s1 = mask->nb[1] / sizeof(sycl::half);
+
+    dpct::queue_ptr stream = ctx.stream();
+
+    ggml_sycl_pool_alloc<int32_t>    idx_alloc(ctx.pool(), (size_t) n_kv_g);
+    ggml_sycl_pool_alloc<int32_t>    cnt_alloc(ctx.pool(), 1);
+    ggml_sycl_pool_alloc<uint8_t>    k_alloc(ctx.pool(), (size_t) n_head_k * n_kv_g * k_row);
+    ggml_sycl_pool_alloc<uint8_t>    v_alloc(ctx.pool(), (size_t) n_head_k * n_kv_g * v_row);
+    ggml_sycl_pool_alloc<sycl::half> m_alloc(ctx.pool(), (size_t) chunk * n_kv_g);
+    ggml_sycl_pool_alloc<sycl::half> u_alloc(ctx.pool(), (size_t) n_kv);
+
+    int32_t *    d_idx  = idx_alloc.get();
+    int32_t *    d_cnt  = cnt_alloc.get();
+    uint8_t *    d_K    = k_alloc.get();
+    uint8_t *    d_V    = v_alloc.get();
+    sycl::half * d_mask = m_alloc.get();
+    sycl::half * d_uni  = u_alloc.get();
+
+    for (int64_t r0 = 0; r0 < n_rows; r0 += chunk) {
+        const int64_t rows_c = (chunk < n_rows - r0) ? chunk : (n_rows - r0);
+        const sycl::half * mask_c = (const sycl::half *) mask->data + r0 * (int64_t) mask_s1;
+
+        sparse_fa_union_rows(stream, mask_c, d_uni, n_kv, rows_c, mask_s1);
+
+        // reset with a kernel: on Level Zero a queue memset is not always ordered before the next kernel
+        stream->single_task([=]() { *d_cnt = 0; });
+
+        sparse_fa_compact_mask(stream, d_uni, d_idx, d_cnt, n_kv, n_kv_g);
+
+        sparse_fa_gather_rows(stream, (const uint8_t *) K->data, d_K, d_idx, d_cnt,
+                              k_row, K->nb[1], K->nb[2], n_kv_g, n_head_k);
+
+        sparse_fa_gather_rows(stream, (const uint8_t *) V->data, d_V, d_idx, d_cnt,
+                              v_row, V->nb[1], V->nb[2], n_kv_g, n_head_k);
+
+        sparse_fa_gather_mask(stream, mask_c, d_mask, d_idx, d_cnt,
+                              n_kv_g, rows_c, mask_s1);
+
+        if (sparse_fa_debug() && stream->ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording) {
+            int32_t h_cnt = 0;
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(&h_cnt, d_cnt, sizeof(int32_t))));
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+            fprintf(stderr, "[FA-SPARSE-PF] r0=%lld rows=%lld n_kv=%lld bound=%lld finite=%d%s\n",
+                    (long long) r0, (long long) rows_c, (long long) n_kv,
+                    (long long) n_kv_g, (int) h_cnt,
+                    h_cnt > (int32_t) n_kv_g ? "  OVERFLOW" : "");
+        }
+
+        ggml_tensor Q_c = *Q;
+        Q_c.data  = (char *) Q->data + r0 * Q->nb[1];
+        Q_c.ne[1] = rows_c;
+
+        // shallow copies retargeted at the gathered buffers; kernels are unchanged
+        ggml_tensor K_g = *K;
+        K_g.data      = d_K;
+        K_g.ne[1]     = n_kv_g;
+        K_g.nb[1]     = k_row;
+        K_g.nb[2]     = (size_t) n_kv_g * k_row;
+        K_g.nb[3]     = (size_t) n_head_k * n_kv_g * k_row;
+        K_g.view_src  = nullptr;
+        K_g.view_offs = 0;
+
+        ggml_tensor V_g = *V;
+        V_g.data      = d_V;
+        V_g.ne[1]     = n_kv_g;
+        V_g.nb[1]     = v_row;
+        V_g.nb[2]     = (size_t) n_kv_g * v_row;
+        V_g.nb[3]     = (size_t) V->ne[2] * n_kv_g * v_row;
+        V_g.view_src  = nullptr;
+        V_g.view_offs = 0;
+
+        ggml_tensor M_g = *mask;
+        M_g.data      = d_mask;
+        M_g.ne[0]     = n_kv_g;
+        M_g.ne[1]     = rows_c;
+        M_g.nb[1]     = (size_t) n_kv_g * sizeof(sycl::half);
+        M_g.nb[2]     = M_g.nb[1] * (size_t) rows_c;
+        M_g.nb[3]     = M_g.nb[2];
+        M_g.view_src  = nullptr;
+        M_g.view_offs = 0;
+
+        ggml_tensor dst_c = *dst;
+        dst_c.data         = (char *) dst->data + r0 * dst->nb[2];
+        dst_c.ne[2]        = rows_c;
+        dst_c.src[0]       = &Q_c;
+        dst_c.src[1]       = &K_g;
+        dst_c.src[2]       = &V_g;
+        dst_c.src[3]       = &M_g;
+        dst_c.op_params[4] = 0;   // avoid re-entering this path
+
+        ggml_sycl_flash_attn_ext(ctx, &dst_c);
+    }
+
+    return true;
+}
+
 bool ggml_sycl_flash_attn_ext_sparse(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    // prefill branch: multi-row Q with the chunk env set; disjoint from the
+    // decode branch below, whose gate requires Q->ne[1] == 1
+    if (sparse_fa_enabled() && sparse_fa_prefill_chunk() > 0 &&
+            dst->src[0] != nullptr && dst->src[0]->ne[1] > 1) {
+        int64_t chunk  = 0;
+        int64_t n_kv_g = 0;
+        if (sparse_fa_prefill_applicable(dst, chunk, n_kv_g)) {
+            return sparse_fa_prefill_gather(ctx, dst, chunk, n_kv_g);
+        }
+        return false;
+    }
+
     int64_t n_kv_g = 0;
     if (!sparse_fa_enabled() || !sparse_fa_applicable(dst, n_kv_g)) {
         return false;

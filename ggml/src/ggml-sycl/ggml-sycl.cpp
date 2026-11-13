@@ -176,6 +176,7 @@ int g_ggml_sycl_get_mem_api = MEMORY_API_TYPE_LEVEL_ZERO;
 int g_ggml_sycl_enable_sparse_fa = 0;
 int g_ggml_sycl_debug_sparse_fa = 0;
 int g_ggml_sycl_sparse_fa_margin = 256;
+int g_ggml_sycl_sparse_fa_prefill = 0;
 int g_ggml_sycl_graph_eviction_timeout = 10;
 
 #if GGML_SYCL_DNNL
@@ -514,6 +515,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_sparse_fa = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA", 0);
         g_ggml_sycl_debug_sparse_fa = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA_DEBUG", 0);
         g_ggml_sycl_sparse_fa_margin = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA_MARGIN", 256);
+        g_ggml_sycl_sparse_fa_prefill = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA_PREFILL", 0);
 
         GGML_SYCL_DEBUG("[SYCL] call ggml_check_sycl\n");
 
@@ -654,6 +656,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_SPARSE_FA: %d\n", g_ggml_sycl_enable_sparse_fa);
         GGML_LOG_INFO("  GGML_SYCL_SPARSE_FA_DEBUG: %d\n", g_ggml_sycl_debug_sparse_fa);
         GGML_LOG_INFO("  GGML_SYCL_SPARSE_FA_MARGIN: %d\n", g_ggml_sycl_sparse_fa_margin);
+        GGML_LOG_INFO("  GGML_SYCL_SPARSE_FA_PREFILL: %d\n", g_ggml_sycl_sparse_fa_prefill);
 
 /* NOT REMOVE, keep it for next optimize for XMX.
 #if defined(GGML_SYCL_SUPPORT_XMX) && !defined(GGML_SYCL_FORCE_MMQ)
