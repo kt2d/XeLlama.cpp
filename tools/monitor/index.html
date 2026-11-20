@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="data:,">
+<title>XeLlama Monitor</title>
+<link rel="stylesheet" href="monitor.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <h1>XeLlama Monitor</h1>
+      <span class="sub">llama.cpp / Strata風</span>
+    </div>
+    <div class="conn">
+      <span class="status" id="connStatus"><span class="dot" id="connDot"></span><span id="connText">接続中…</span></span>
+      <input id="baseInput" type="url" inputmode="url" autocomplete="off" spellcheck="false" aria-label="サーバー URL" value="http://192.168.0.17:11434">
+      <button id="connectBtn" type="button">接続</button>
+    </div>
+  </header>
+
+  <div class="notice" id="downNotice"><strong>サーバーに接続できません。</strong> <span id="downDetail">/props と /metrics の両方への接続に失敗しました。サーバーが起動しているか、URL とポート（11434）を確認してください。2秒ごとに再試行します。</span></div>
+
+  <section class="cards" aria-label="概要">
+    <!-- Model -->
+    <article class="card">
+      <div class="label"><span>モデル</span><span class="dot" id="modelDot"></span></div>
+      <div class="big" style="font-size:20px" id="modelState">—</div>
+      <div class="model-name" id="modelName">—</div>
+      <div class="subline" id="modelMeta">スロット — · コンテキスト —</div>
+      <div class="subline" id="modelReq">処理中 — · 保留 —</div>
+    </article>
+
+    <!-- Decode -->
+    <article class="card">
+      <div class="label"><span>デコード速度</span><span>decode</span></div>
+      <div class="big"><span id="decodeSpeed">—</span><span class="unit">tok/s</span></div>
+      <canvas class="spark" id="spark" width="260" height="52" aria-label="デコード速度の推移"></canvas>
+      <div class="subline">生成済み合計 <b id="decodeTotal">—</b> トークン</div>
+      <div class="subline" id="decodeAvg">平均 —</div>
+    </article>
+
+    <!-- Prompt -->
+    <article class="card">
+      <div class="label"><span>プロンプト処理</span><span>prefill</span></div>
+      <div class="big"><span id="promptSpeed">—</span><span class="unit">tok/s</span></div>
+      <div class="subline">処理済み合計 <b id="promptTotal">—</b> トークン</div>
+      <div class="subline">キャッシュ再利用 <b id="promptCached">—</b> トークン</div>
+      <div class="subline" id="promptCacheRate">キャッシュ率 —</div>
+    </article>
+
+    <!-- Speculative -->
+    <article class="card">
+      <div class="label"><span>投機デコード</span><span>DFlash</span></div>
+      <div class="big"><span id="specRate">—</span><span class="unit" id="specUnit"></span></div>
+      <div class="bars" id="specBars"><div class="empty-note">データ待ち</div></div>
+      <div class="subline" id="specSub">—</div>
+    </article>
+
+    <!-- Context -->
+    <article class="card">
+      <div class="label"><span>コンテキスト使用率</span><span>最大スロット</span></div>
+      <div class="big"><span id="ctxPct">—</span><span class="unit">%</span></div>
+      <div class="meter" id="ctxMeter"><i style="width:0%"></i></div>
+      <div class="subline" id="ctxDetail">—</div>
+      <div class="subline">観測最大トークン数 <b id="ctxMax">—</b></div>
+    </article>
+  </section>
+
+  <div class="section-head">
+    <h2>スロット</h2>
+    <span class="hint" id="slotsHint">現在のスロット状態（2秒ごとに更新）</span>
+  </div>
+  <section id="slotsPanel" aria-label="スロット一覧">
+    <div class="unavail">読み込み中…</div>
+  </section>
+
+  <footer>
+    <span>デコード呼び出し合計 <b id="footDecode">—</b></span>
+    <span>デコードあたりビジースロット <b id="footBusy">—</b></span>
+    <span>最終更新 <b id="footUpdated">—</b></span>
+    <span class="foot-note">llama.cpp はリクエスト履歴を保持しないため、表示できるのは各スロットの現在／直近のタスクのみです。履歴ベースのビューは Strata と異なります。</span>
+  </footer>
+</div>
+
+<script src="monitor.js"></script>
+</body>
+</html>
