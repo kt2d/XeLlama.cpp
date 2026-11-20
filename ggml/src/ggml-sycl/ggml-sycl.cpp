@@ -3361,7 +3361,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
     // reorder install cannot run on src0->data. Anything outside the gate falls through.
     if (g_ggml_sycl_dpas_gemm && src0->type == GGML_TYPE_Q4_K &&
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-        dst->op_params[0] == GGML_PREC_DEFAULT &&
+        ggml_prec_get_acc(dst) == GGML_PREC_UNDEFINED &&
         ggml_is_contiguous(src0) && row_diff == src0->ne[1] &&
         src0->ne[2] == 1 && src0->ne[3] == 1 && src0->view_src == nullptr &&
         src1_ncols > MMQ_MAX_BATCH_SIZE && src0->ne[0] % QK_K == 0 &&
