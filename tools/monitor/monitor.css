@@ -39,6 +39,8 @@ header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:s
 @media(max-width:1020px){.cards{grid-template-columns:repeat(3,1fr)}}
 @media(max-width:640px){.cards{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:420px){.cards{grid-template-columns:1fr}}
+.cards.gpu{grid-template-columns:repeat(2,1fr)}
+@media(max-width:640px){.cards.gpu{grid-template-columns:1fr}}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 14px 12px;min-width:0;display:flex;flex-direction:column;gap:6px}
 .card .label{font-size:11.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);display:flex;justify-content:space-between;align-items:center;gap:8px}
 .card .big{font-size:32px;line-height:1.05;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.01em}

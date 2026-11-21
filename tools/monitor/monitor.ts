@@ -43,6 +43,7 @@ interface Metrics {
   tokens_predicted_seconds_total?: number;
   prompt_tokens_seconds?: number;
   prompt_tokens_total?: number;
+  prompt_seconds_total?: number;
   prompt_tokens_cached_total?: number;
   requests_processing?: number;
   requests_deferred?: number;
@@ -54,33 +55,38 @@ interface Metrics {
   spec_decode_num_drafts_total?: number;
 }
 
+interface GpuDevice {
+  bdf: string;
+  name: string;
+  vram_resident_gib?: number | null;
+  vram_total_gib?: number | null;
+  vram_pct?: number | null;
+  busy_ccs_pct?: number | null;
+  busy_bcs_pct?: number | null;
+  freq_act_mhz?: number | null;
+  freq_cur_mhz?: number | null;
+  freq_max_mhz?: number | null;
+}
+
+interface GpuSnapshot {
+  devices?: GpuDevice[];
+}
+
 type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown };
 
-const LS_KEY = "xellama-monitor-base";
-const DEFAULT_BASE = "http://192.168.0.17:11434";
 const POLL_MS = 2000;
 const HISTORY_MAX = 90;
 
-let base: string = DEFAULT_BASE;
-try {
-  const saved = localStorage.getItem(LS_KEY);
-  if (saved) base = saved;
-} catch (e) { /* storage unavailable: keep the default */ }
-base = normalizeBase(base);
-
-const input = document.getElementById("baseInput") as HTMLInputElement;
-input.value = base;
+// The monitor is served by xellama-gpu-telemetry from the same origin
+// that proxies llama-server, so every API path is relative to this
+// page. No server-URL form, no persisted base, no origin to compute.
+const base = "";
 
 const decodeHistory: number[] = [];
 let timer: number | undefined = undefined;
+let gpuTimer: number | undefined = undefined;
 // scroll state per pane, keyed "p<slotId>" / "g<slotId>"
 const lastSlotsScroll: { [key: string]: { top: number; atBottom: boolean } } = {};
-
-function normalizeBase(v: string): string {
-  let s = String(v || "").trim();
-  while (s.length && s.charAt(s.length - 1) === "/") s = s.slice(0, -1);
-  return s || DEFAULT_BASE;
-}
 
 function esc(s: unknown): string {
   return String(s == null ? "" : s)
@@ -365,13 +371,13 @@ function render(propsRes: Settled<LlamaProps>, metricsRes: Settled<Metrics>, slo
   // Decode card
   if (metricsOk) {
     const dSpeed = m.predicted_tokens_seconds;
-    $("decodeSpeed").textContent = dSpeed == null ? "—" : fmtFloat(dSpeed, 2);
-    $("decodeTotal").textContent = fmtNum(m.tokens_predicted_total);
     if (m.tokens_predicted_seconds_total && m.tokens_predicted_total) {
-      $("decodeAvg").textContent = "累計平均 " + fmtFloat(m.tokens_predicted_total / m.tokens_predicted_seconds_total, 2) + " tok/s";
+      $("decodeSpeed").textContent = fmtFloat(m.tokens_predicted_total / m.tokens_predicted_seconds_total, 2);
     } else {
-      $("decodeAvg").textContent = "平均 —";
+      $("decodeSpeed").textContent = "—";
     }
+    $("decodeTotal").textContent = fmtNum(m.tokens_predicted_total);
+    $("decodeAvg").textContent = "瞬間 " + (dSpeed == null ? "—" : fmtFloat(dSpeed, 2) + " tok/s");
     if (dSpeed != null && !isNaN(dSpeed)) {
       decodeHistory.push(dSpeed);
       if (decodeHistory.length > HISTORY_MAX) decodeHistory.shift();
@@ -381,7 +387,11 @@ function render(propsRes: Settled<LlamaProps>, metricsRes: Settled<Metrics>, slo
 
   // Prompt card
   if (metricsOk) {
-    $("promptSpeed").textContent = m.prompt_tokens_seconds == null ? "—" : fmtFloat(m.prompt_tokens_seconds, 1);
+    if (m.prompt_seconds_total && m.prompt_tokens_total) {
+      $("promptSpeed").textContent = fmtFloat(m.prompt_tokens_total / m.prompt_seconds_total, 1);
+    } else {
+      $("promptSpeed").textContent = "—";
+    }
     $("promptTotal").textContent = fmtNum(m.prompt_tokens_total);
     $("promptCached").textContent = fmtNum(m.prompt_tokens_cached_total);
     if (m.prompt_tokens_total) {
@@ -473,7 +483,7 @@ function poll(): void {
   const p2 = settled(fetchText(b + "/metrics").then(parseMetrics));
   const p3 = settled(fetchJson<LlamaSlot[]>(b + "/slots"));
   Promise.all([p1, p2, p3]).then((res) => {
-    // ignore stale results if base changed mid-flight
+    // base is fixed to this origin; kept as a cheap in-flight guard
     if (b !== base) return;
     render(res[0], res[1], res[2]);
   });
@@ -483,25 +493,42 @@ function startPolling(): void {
   if (timer !== undefined) window.clearInterval(timer);
   poll();
   timer = window.setInterval(poll, POLL_MS);
+  if (gpuTimer !== undefined) window.clearInterval(gpuTimer);
+  pollGpu();
+  gpuTimer = window.setInterval(pollGpu, POLL_MS);
 }
 
-function connect(): void {
-  base = normalizeBase(input.value);
-  input.value = base;
-  try {
-    localStorage.setItem(LS_KEY, base);
-  } catch (e) { /* storage unavailable */ }
-  decodeHistory.length = 0;
-  for (const k of Object.keys(lastSlotsScroll)) delete lastSlotsScroll[k];
-  startPolling();
-}
+/* ---------- GPU telemetry (same-origin /gpu.json) ---------- */
 
-$("connectBtn").addEventListener("click", connect);
-input.addEventListener("keydown", (e: KeyboardEvent) => {
-  if (e.key === "Enter") {
-    e.preventDefault();
-    connect();
+function gpuCardHtml(d: GpuDevice): string {
+  const pct = d.vram_pct == null ? 0 : Math.max(0, Math.min(100, d.vram_pct));
+  const freq = d.freq_act_mhz != null ? d.freq_act_mhz : d.freq_cur_mhz;
+  let h = "<article class=\"card\">";
+  h += "<div class=\"label\"><span>" + esc(d.name || d.bdf) + "</span><span>GPU</span></div>";
+  h += "<div class=\"big\">" + fmtFloat(d.vram_resident_gib, 1) + "<span class=\"unit\">GiB</span></div>";
+  h += "<div class=\"meter\"><i style=\"width:" + pct.toFixed(1) + "%\"></i></div>";
+  h += "<div class=\"subline\">VRAM 合計 <b>" + fmtFloat(d.vram_total_gib, 2) + " GiB</b> · 使用率 <b>" + fmtFloat(d.vram_pct, 1) + "%</b></div>";
+  h += "<div class=\"subline\">計算 CCS <b>" + fmtFloat(d.busy_ccs_pct, 0) + "%</b> · コピー BCS <b>" + fmtFloat(d.busy_bcs_pct, 0) + "%</b></div>";
+  if (freq != null || d.freq_max_mhz != null) {
+    h += "<div class=\"subline\">周波数 <b>" + fmtNum(freq) + "</b> / " + fmtNum(d.freq_max_mhz) + " MHz</div>";
   }
-});
+  h += "</article>";
+  return h;
+}
+
+function renderGpu(res: Settled<GpuSnapshot>): void {
+  const el = $("gpuCards");
+  if (!res.ok || !res.value.devices || res.value.devices.length === 0) {
+    el.innerHTML = "<article class=\"card\"><div class=\"label\"><span>GPU</span><span>TELEMETRY</span></div>" +
+      "<div class=\"big\">—</div><div class=\"subline\">GPU テレメトリ取得不可（/gpu.json）</div></article>";
+    return;
+  }
+  el.innerHTML = res.value.devices.map(gpuCardHtml).join("");
+}
+
+function pollGpu(): void {
+  settled(fetchJson<GpuSnapshot>(base + "/gpu.json")).then(renderGpu);
+}
+
 window.addEventListener("resize", drawSpark);
 startPolling();
