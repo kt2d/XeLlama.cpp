@@ -17,12 +17,10 @@
     </div>
     <div class="conn">
       <span class="status" id="connStatus"><span class="dot" id="connDot"></span><span id="connText">接続中…</span></span>
-      <input id="baseInput" type="url" inputmode="url" autocomplete="off" spellcheck="false" aria-label="サーバー URL" value="http://192.168.0.17:11434">
-      <button id="connectBtn" type="button">接続</button>
     </div>
   </header>
 
-  <div class="notice" id="downNotice"><strong>サーバーに接続できません。</strong> <span id="downDetail">/props と /metrics の両方への接続に失敗しました。サーバーが起動しているか、URL とポート（11434）を確認してください。2秒ごとに再試行します。</span></div>
+  <div class="notice" id="downNotice"><strong>サーバーに接続できません。</strong> <span id="downDetail">/props と /metrics の両方への接続に失敗しました。llama-server が起動しているか、この origin のテレメトリが llama-server（:11434）に届いているかを確認してください。2秒ごとに再試行します。</span></div>
 
   <section class="cards" aria-label="概要">
     <!-- Model -->
@@ -67,6 +65,14 @@
       <div class="meter" id="ctxMeter"><i style="width:0%"></i></div>
       <div class="subline" id="ctxDetail">—</div>
       <div class="subline">観測最大トークン数 <b id="ctxMax">—</b></div>
+    </article>
+  </section>
+
+  <section class="cards gpu" id="gpuCards" aria-label="GPU">
+    <article class="card">
+      <div class="label"><span>GPU</span><span>TELEMETRY</span></div>
+      <div class="big">—</div>
+      <div class="subline">GPU テレメトリ待ち</div>
     </article>
   </section>
 

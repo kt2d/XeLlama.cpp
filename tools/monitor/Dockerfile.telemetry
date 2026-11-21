@@ -1,0 +1,7 @@
+# Builds the xellama-gpu-telemetry binary without a Go toolchain
+# on the host. The launcher mounts telemetry/ at /src (read-only)
+# and the output directory at /out; the build itself happens in a
+# scratch dir inside the container. Static binary (CGO off),
+# same flags as the reference build.
+FROM golang:1.27-alpine
+ENTRYPOINT ["sh", "-c", "mkdir -p /tmp/build && cp /src/* /tmp/build/ && cd /tmp/build && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/xellama-gpu-telemetry ."]

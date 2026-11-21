@@ -1,0 +1,8 @@
+# Builds the XeLlama Monitor web assets (monitor.js from
+# monitor.ts) without node/npm on the host. The launcher mounts
+# the repo's tools/monitor directory at /src (read-only) and the
+# output directory at /out; this image only provides node +
+# TypeScript 5 and copies/compiles into /out.
+FROM node:20-alpine
+RUN npm install -g typescript@5
+ENTRYPOINT ["sh", "-c", "cp /src/index.html /src/monitor.css /out/ && tsc /src/monitor.ts --target ES2020 --outDir /out"]
