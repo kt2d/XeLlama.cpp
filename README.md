@@ -12,14 +12,20 @@
 > connected to Intel, Meta, or ggml-org. Upstream development happens in llama.cpp;
 > this fork carries Xe-specific changes on top of it.
 >
-> What this fork adds (work in progress, rebased onto upstream master `3b4d6ab`):
+> What this fork adds (work in progress, based on upstream v1.0.0 `b1b770d`):
 >
 > - QSA (Qwen Sparse Attention) support for Qwen3.8-27B on the SYCL backend
 > - SYCL/XMX kernel work for Arc B60 (Xe2) and A770 (Xe1): mixed-type fattn-dpas,
 >   wide-column int8 DPAS prefill GEMM, and sg8 fattn-dpas for Alchemist
 > - A measured long-context configuration (tensor split, q8_0/q4_0 KV,
->   `GGML_SYCL_SPARSE_FA=1`, `GGML_SYCL_FA_ONEDNN=0`, `GGML_SYCL_DPAS_GEMM=1`,
+>   `GGML_SYCL_SPARSE_FA=1`, `GGML_SYCL_FA_ONEDNN=0`, `GGML_SYCL_DPAS_GEMM=0`,
 >   `GGML_SYCL_FA_DPAS_SG8=1`), with MTP off for long-context use
+> - DFlash speculative decoding in the production shape (ownhead drafter,
+>   n-max 3); see the [DFlash appendix](docs/dflash-appendix.md) for the
+>   two load-time blockers and their fixes
+> - Utilities under `scripts/`: a preflight capacity planner
+>   (`run-capacity-plan-v1.sh`) and a one-command regression gate bundle
+>   (`run-xellama-check-v1.sh`: counting, perplexity, speed floors)
 >
 > **Credits**: The QSA model and its trained indexers are by
 > [higa2515](https://huggingface.co/higa2515/Qwen3.8-27B-QSA-GGUF).
