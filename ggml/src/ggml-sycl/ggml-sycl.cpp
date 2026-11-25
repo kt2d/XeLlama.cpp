@@ -6748,6 +6748,11 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
         return 0;
     }
 
+    // replay ops (src[6] set) write a single committed state, not snapshot slots
+    if (gdn->src[6] != nullptr) {
+        return 0;
+    }
+
     const ggml_tensor * src_v     = gdn->src[2];
     const int64_t       S_v       = src_v->ne[0];
     const int64_t       H         = src_v->ne[1];
@@ -7819,8 +7824,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_OPT_STEP_SGD:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            // replay of pending tokens (op param 1) is not implemented
-            return ggml_get_op_params_i32(op, 1) == 0;
+            // replay of pending tokens (op param 1) is implemented for non-KDA only;
+            // KDA is the vector-gate form (src[3] width == value width)
+            return ggml_get_op_params_i32(op, 1) == 0 || op->src[3]->ne[0] != op->src[2]->ne[0];
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
