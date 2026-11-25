@@ -65,6 +65,7 @@ htp_op_code htp_op_remap(const struct ggml_tensor * t) {
         case GGML_OP_CONV_2D_DW:      return HTP_OP_CONV_2D_DW;
         case GGML_OP_CONV_3D:         return HTP_OP_CONV_3D;
         case GGML_OP_ROLL:            return HTP_OP_ROLL;
+        case GGML_OP_TIMESTEP_EMBEDDING: return HTP_OP_TIMESTEP_EMBEDDING;
         case GGML_OP_UPSCALE:         return HTP_OP_UPSCALE;
         case GGML_OP_LIGHTNING_INDEXER: return HTP_OP_LIGHTNING_INDEXER;
 
@@ -354,8 +355,8 @@ static bool htp_kparams_solve_flash_attn(
         return false;
     }
 
-    // K/V row lists (ggml_flash_attn_ext_rows) are not supported
-    if (op->src[5] != nullptr) {
+    // K/V row lists and indexed bias are not supported
+    if (op->src[5] != nullptr || ggml_flash_attn_ext_has_indexed_bias(op)) {
         return false;
     }
 
@@ -513,7 +514,12 @@ static bool htp_kparams_solve_gated_delta_net(
     const struct ggml_tensor * g     = op->src[3];
     const struct ggml_tensor * beta  = op->src[4];
     const struct ggml_tensor * state = op->src[5];
+    const struct ggml_tensor * pend_k  = op->src[6];
+    const struct ggml_tensor * pend_v  = op->src[7];
+    const struct ggml_tensor * pend_gb = op->src[8];
+    const struct ggml_tensor * n_rep   = op->src[9];
     const struct ggml_tensor * dst   = op;
+    const bool replay = pend_k != nullptr;
 
     if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32 ||
         g->type != GGML_TYPE_F32 || beta->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 ||
@@ -550,6 +556,22 @@ static bool htp_kparams_solve_gated_delta_net(
     if (dst->ne[0] != S_v * H || dst->ne[1] != n_tokens * n_seqs + S_v * n_seqs * K ||
         dst->ne[2] != 1 || dst->ne[3] != 1) {
         return false;
+    }
+    if ((pend_v != nullptr) != replay || (pend_gb != nullptr) != replay || (n_rep != nullptr) != replay) {
+        return false;
+    }
+    if (replay) {
+        const int64_t n_pend = ggml_get_op_params_i32(op, 1);
+
+        if (K != 1 || n_pend < 0 || pend_k->type != GGML_TYPE_F32 || pend_v->type != GGML_TYPE_F32 ||
+            pend_gb->type != GGML_TYPE_F32 || n_rep->type != GGML_TYPE_I32 ||
+            pend_k->nb[0] != sizeof(float) || pend_v->nb[0] != sizeof(float) || pend_gb->nb[0] != sizeof(float) ||
+            pend_k->ne[0] != k->ne[0] || pend_k->ne[1] != k->ne[1] || pend_k->ne[2] != n_pend || pend_k->ne[3] != n_seqs ||
+            pend_v->ne[0] != S_v || pend_v->ne[1] != H || pend_v->ne[2] != n_pend || pend_v->ne[3] != n_seqs ||
+            pend_gb->ne[0] != g->ne[0] || pend_gb->ne[1] != H || pend_gb->ne[2] != 2*n_pend || pend_gb->ne[3] != n_seqs ||
+            !ggml_is_contiguous(n_rep) || ggml_nelements(n_rep) != n_seqs) {
+            return false;
+        }
     }
 
     const uint32_t rq3        = (uint32_t) (n_seqs / q->ne[3]);
@@ -3808,6 +3830,94 @@ static bool htp_kparams_solve_fill(
     return true;
 }
 
+static bool htp_kparams_solve_timestep_embedding(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * op,
+    struct htp_timestep_kernel_params * kparams
+) {
+    memset(kparams, 0, sizeof(*kparams));
+
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int32_t dim        = ggml_get_op_params_i32(op, 0);
+    const int32_t max_period = ggml_get_op_params_i32(op, 1);
+
+    if (dim <= 0 || max_period <= 0) {
+        return false;
+    }
+    if (src0->ne[1] != 1 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        dst->ne[0] != dim || dst->ne[1] != src0->ne[0] || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous_rows(src0) || !ggml_is_contiguous_rows(dst)) {
+        return false;
+    }
+
+    if (src0->ne[0] <= 0 || src0->ne[0] > INT32_MAX || dim < 2) {
+        return false;
+    }
+
+    // below this many output elements threading costs more than it saves
+    constexpr uint32_t min_split_elems = 1024;
+    // target size of one VTCM output buffer per thread
+    constexpr size_t out_buf_budget = 16 * 1024;
+
+    const uint32_t n_rows   = (uint32_t) src0->ne[0];
+    const uint32_t half     = (uint32_t) dim / 2;
+    const uint32_t n_blocks = (half + HTP_TIMESTEP_BLOCK - 1) / HTP_TIMESTEP_BLOCK;
+
+    // split rows or freq blocks, whichever keeps more threads busy
+    const uint32_t max_hvx    = (uint64_t) n_rows * (uint32_t) dim < min_split_elems ? 1 : htp_session_n_hvx(sess);
+    const uint32_t hvx_rows   = (std::min)(max_hvx, n_rows);
+    const uint32_t hvx_cols   = (std::min)(max_hvx, n_blocks);
+    const bool     split_cols = hvx_cols > hvx_rows;
+
+    uint32_t rows_per_hvx   = n_rows;
+    uint32_t blocks_per_hvx = n_blocks;
+    uint32_t n_hvx          = 1;
+    if (split_cols) {
+        blocks_per_hvx = (n_blocks + hvx_cols - 1) / hvx_cols;
+        n_hvx          = (n_blocks + blocks_per_hvx - 1) / blocks_per_hvx;
+    } else {
+        rows_per_hvx = (n_rows + hvx_rows - 1) / hvx_rows;
+        n_hvx        = (n_rows + rows_per_hvx - 1) / rows_per_hvx;
+    }
+
+    struct htp_timestep_vtcm_layout layout;
+    htp_timestep_vtcm_layout_build(&layout, (uint32_t) dim, blocks_per_hvx, 1, n_hvx);
+
+    const size_t row_bytes  = layout.out_buf_size; // one [cos | sin] row
+    uint32_t     chunk_rows = (uint32_t) (std::max)((size_t) 1, (std::min)((size_t) rows_per_hvx, out_buf_budget / row_bytes));
+
+    htp_timestep_vtcm_layout_build(&layout, (uint32_t) dim, blocks_per_hvx, chunk_rows, n_hvx);
+    while (layout.total_bytes > htp_session_vtcm_size(sess) && chunk_rows > 1) {
+        chunk_rows /= 2;
+        htp_timestep_vtcm_layout_build(&layout, (uint32_t) dim, blocks_per_hvx, chunk_rows, n_hvx);
+    }
+    if (layout.total_bytes > htp_session_vtcm_size(sess)) {
+        return false;
+    }
+
+    kparams->n_hvx          = n_hvx;
+    kparams->n_rows         = n_rows;
+    kparams->dim            = (uint32_t) dim;
+    kparams->half           = half;
+    kparams->n_blocks       = n_blocks;
+    kparams->split_cols     = split_cols ? 1 : 0;
+    kparams->rows_per_hvx   = rows_per_hvx;
+    kparams->blocks_per_hvx = blocks_per_hvx;
+    kparams->chunk_rows     = chunk_rows;
+    kparams->vtcm_size      = (uint32_t) layout.total_bytes;
+    kparams->freq_scale     = -logf((float) max_period) / (float) half;
+
+    return true;
+}
+
 static bool htp_kparams_solve_roll(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
@@ -5662,6 +5772,9 @@ bool htp_kparams_solve(
 
         case HTP_OP_ROLL:
             return htp_kparams_invoke<htp_kparams_solve_roll>(sess, op, kparams);
+
+        case HTP_OP_TIMESTEP_EMBEDDING:
+            return htp_kparams_invoke<htp_kparams_solve_timestep_embedding>(sess, op, kparams);
 
         case HTP_OP_LIGHTNING_INDEXER:
             return htp_kparams_invoke<htp_kparams_solve_lightning_indexer>(sess, op, kparams);
