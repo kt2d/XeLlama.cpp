@@ -7823,10 +7823,33 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             return true;
-        case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET: {
             // replay of pending tokens (op param 1) is implemented for non-KDA only;
             // KDA is the vector-gate form (src[3] width == value width)
-            return ggml_get_op_params_i32(op, 1) == 0 || op->src[3]->ne[0] != op->src[2]->ne[0];
+            if (ggml_get_op_params_i32(op, 1) != 0 && op->src[3]->ne[0] == op->src[2]->ne[0]) {
+                return false;
+            }
+            // The SYCL launcher (ggml-sycl/gated_delta_net.cpp) asserts the layout
+            // its kernel assumes: q/k/v contiguous rows, q and k the same strides
+            // (the kernel indexes k with q's strides), q/k head counts equal, g
+            // contiguous (scalar gate, or KDA vector gate), beta and state contiguous.
+            // Decline anything else here so the scheduler falls back to CPU instead
+            // of aborting in the launcher. Production qwen35 graphs are contiguous
+            // with matching q/k strides, so this changes nothing there; it only lets
+            // test-backend-ops' padded/permuted GDN cases run through the CPU path.
+            const ggml_tensor * src_q     = op->src[0];
+            const ggml_tensor * src_k     = op->src[1];
+            const ggml_tensor * src_v     = op->src[2];
+            const ggml_tensor * src_g     = op->src[3];
+            const ggml_tensor * src_beta  = op->src[4];
+            const ggml_tensor * src_state = op->src[5];
+            return src_q->ne[1] == src_k->ne[1] &&
+                   ggml_is_contiguous_rows(src_q) && ggml_is_contiguous_rows(src_k) &&
+                   ggml_is_contiguous_rows(src_v) && ggml_are_same_stride(src_q, src_k) &&
+                   (src_g->ne[0] == 1 || src_g->ne[0] == src_v->ne[0]) &&
+                   ggml_is_contiguous(src_g) && ggml_is_contiguous(src_beta) &&
+                   ggml_is_contiguous(src_state);
+        }
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
